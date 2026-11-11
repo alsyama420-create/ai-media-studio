@@ -64,7 +64,7 @@ export async function buatVideo(formData: FormData) {
   )[0];
   if (!production) throw new Error("Episode tidak ditemukan.");
   if (!production.naskah) throw new Error("Episode ini belum punya naskah.");
-  if (!["fact_check", "editing", "quality_check"].includes(production.status)) {
+  if (!["storyboard", "editing", "quality_check"].includes(production.status)) {
     throw new Error(`Video belum bisa dibuat. Status episode: ${production.status}.`);
   }
 
