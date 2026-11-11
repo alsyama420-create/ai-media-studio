@@ -6,44 +6,81 @@ import { redirect } from "next/navigation";
 
 const MAKS_PERCOBAAN = 3;
 const MIN_FAKTA = 3;
-const MAKS_KATA = 150;
+const MIN_KATA = 90;
+const MAKS_KATA = 130;
+const DETIK_PER_KATA = 0.47;
+const MODEL = ["gemini-flash-lite-latest", "gemini-3-flash-preview"];
 
-const KATA_UMUM = new Set([
-  "mengapa", "kenapa", "bagaimana", "apa", "apakah", "siapa", "kapan",
-  "dimana", "yang", "dan", "atau", "kita", "kami", "kamu", "anda",
-  "harus", "perlu", "bisa", "dapat", "untuk", "dengan", "pada", "adalah",
-  "itu", "ini", "akan", "ada", "tidak", "para", "oleh", "dalam", "serta",
-  "agar", "saat", "ketika", "jika", "lebih", "sangat", "seperti",
-  "tentang", "episode", "part", "bagian", "dari", "ke",
-]);
-
-function ambilKataKunci(judul: string): string[] {
-  const kata = judul
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter((k) => k.length > 2 && !KATA_UMUM.has(k));
-  const unik = Array.from(new Set(kata)).slice(0, 4);
-  return unik.length > 0 ? unik : [judul.toLowerCase().trim()];
-}
-
-function bersihkan(teks: string): string {
-  return teks.replace(/\([^)]*\)/g, "").replace(/\s+/g, " ").trim();
-}
-
-function pecahKalimat(teks: string): string[] {
-  return bersihkan(teks)
-    .split(/(?<=[.!?])\s+(?=[A-Z])/)
-    .map((k) => k.trim())
-    .filter((k) => k.length >= 40 && k.length <= 220);
-}
+type Sumber = { judul_sumber: string; url: string; ringkasan: string };
+type FaktaModel = { teks: string; sumber: string };
+type NaskahModel = {
+  hook: string;
+  fakta: FaktaModel[];
+  penutup: string;
+  pengait: string;
+};
 
 function hitungKata(teks: string): number {
   return teks.split(/\s+/).filter(Boolean).length;
 }
 
-type Sumber = { judul_sumber: string; url: string; ringkasan: string };
-type Fakta = { teks: string; sumber: string; url: string };
+function buatPrompt(judul: string, nomor: number, sumber: Sumber[], catatan: string) {
+  const daftar = sumber
+    .map((s) => `JUDUL SUMBER: ${s.judul_sumber}\n${s.ringkasan.slice(0, 1500)}`)
+    .join("\n\n---\n\n");
+  return `Kamu penulis naskah video edukasi pendek berbahasa Indonesia.
+Judul episode: "${judul}" (Part ${nomor}).
+Tulis narasi untuk video 60 detik, total ${MIN_KATA} sampai ${MAKS_KATA} kata, yang MENJAWAB pertanyaan pada judul.
+
+ATURAN:
+- Gunakan HANYA informasi dari SUMBER di bawah. Jangan menambah fakta dari luar sumber.
+- Abaikan sumber yang tidak relevan dengan judul episode.
+- Bahasa santai, kalimat pendek dan mudah didengar. Jangan pakai tanda kurung, daftar, atau angka rumit.
+- hook: satu kalimat pembuka yang memancing rasa ingin tahu.
+- fakta: 3 sampai 5 kalimat. Setiap kalimat berisi satu fakta, dan "sumber" harus PERSIS sama dengan salah satu JUDUL SUMBER.
+- penutup: satu kalimat.
+- pengait: satu kalimat ajakan menonton Part ${nomor + 1}, dengan petunjuk topik lanjutan yang masih berkaitan.
+${catatan}
+Balas HANYA JSON dengan bentuk: {"hook":"","fakta":[{"teks":"","sumber":""}],"penutup":"","pengait":""}
+
+SUMBER:
+${daftar}`;
+}
+
+async function tanyaGemini(prompt: string): Promise<{ naskah: NaskahModel; model: string }> {
+  const kunci = process.env.GEMINI_API_KEY;
+  if (!kunci) {
+    throw new Error("GEMINI_API_KEY tidak ditemukan. Cek web/.env.local lalu nyalakan ulang server.");
+  }
+  const galat: string[] = [];
+  for (const model of MODEL) {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: "POST",
+          signal: AbortSignal.timeout(60000),
+          headers: { "Content-Type": "application/json", "x-goog-api-key": kunci },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: "application/json", temperature: 0.6 },
+          }),
+        }
+      );
+      if (!res.ok) {
+        galat.push(`${model}: status ${res.status}`);
+        continue;
+      }
+      const data = await res.json();
+      const parts = (data.candidates?.[0]?.content?.parts ?? []) as { text?: string }[];
+      const teks = parts.map((p) => p.text ?? "").join("").replace(/```json|```/g, "").trim();
+      return { naskah: JSON.parse(teks) as NaskahModel, model };
+    } catch (e) {
+      galat.push(`${model}: ${e instanceof Error ? e.name : "error"}`);
+    }
+  }
+  throw new Error(`Semua model Gemini gagal (${galat.join("; ")}).`);
+}
 
 export async function buatNaskah(formData: FormData) {
   const productionId = Number(formData.get("production_id"));
@@ -106,7 +143,7 @@ export async function buatNaskah(formData: FormData) {
      VALUES (?, ?, ?, ?, 'running', ?, ?, NOW())`,
     [
       `Naskah: ${production.judul}`,
-      `Menyusun naskah 60 detik untuk episode ${production.judul}`,
+      `Menulis naskah 60 detik dengan Gemini untuk episode ${production.judul}`,
       agent.id,
       productionId,
       jumlahGagal + 1,
@@ -136,102 +173,55 @@ export async function buatNaskah(formData: FormData) {
       throw new Error("Tidak ada sumber riset untuk episode ini.");
     }
 
-    const kataKunci = ambilKataKunci(production.judul);
-    const urut = [...sumber].sort((a, b) => {
-      const sa = kataKunci.some((k) => a.judul_sumber.toLowerCase().includes(k)) ? 0 : 1;
-      const sb = kataKunci.some((k) => b.judul_sumber.toLowerCase().includes(k)) ? 0 : 1;
-      return sa - sb;
-    });
+    let naskahModel: NaskahModel | null = null;
+    let modelDipakai = "";
+    let catatan = "";
+    let total = 0;
 
-    const hook = `Pernahkah kamu bertanya-tanya, ${production.judul
-      .replace(/\?+$/, "")
-      .toLowerCase()}?`;
-    const penutup = "Itulah beberapa fakta menarik untuk hari ini.";
-    const pengait = `Di Part ${
-      production.nomor_episode + 1
-    }, kita lanjutkan petualangan pengetahuan ini. Ikuti terus!`;
+    for (let coba = 1; coba <= 2; coba++) {
+      const hasil = await tanyaGemini(
+        buatPrompt(production.judul, production.nomor_episode, sumber, catatan)
+      );
+      const n = hasil.naskah;
+      const fakta = Array.isArray(n.fakta) ? n.fakta : [];
+      const sahih = fakta.filter((f) =>
+        sumber.some((s) => s.judul_sumber === f.sumber) && f.teks?.trim()
+      );
+      total =
+        hitungKata(n.hook ?? "") +
+        sahih.reduce((t, f) => t + hitungKata(f.teks), 0) +
+        hitungKata(n.penutup ?? "") +
+        hitungKata(n.pengait ?? "");
 
-    let total = hitungKata(hook) + hitungKata(penutup) + hitungKata(pengait);
-    const fakta: Fakta[] = [];
-    const dipakai = new Set<string>();
-
-    for (let putaran = 0; putaran < 2; putaran++) {
-      for (const s of urut) {
-        const kalimat = pecahKalimat(s.ringkasan)
-          .slice(0, 8)
-          .filter(
-            (k) =>
-              kataKunci.some((kk) => k.toLowerCase().includes(kk)) &&
-              !dipakai.has(k)
-          );
-        const pilih = kalimat[0];
-        if (!pilih) continue;
-        const kata = hitungKata(pilih);
-        if (total + kata > MAKS_KATA) continue;
-        fakta.push({ teks: pilih, sumber: s.judul_sumber, url: s.url });
-        dipakai.add(pilih);
-        total += kata;
+      if (sahih.length < MIN_FAKTA) {
+        catatan = `PERBAIKAN: sebelumnya hanya ${sahih.length} fakta dengan nama sumber yang benar. Pastikan "sumber" sama persis dengan JUDUL SUMBER.`;
+      } else if (total < MIN_KATA || total > MAKS_KATA) {
+        catatan = `PERBAIKAN: sebelumnya ${total} kata. Wajib ${MIN_KATA} sampai ${MAKS_KATA} kata.`;
+      } else {
+        naskahModel = { ...n, fakta: sahih };
+        modelDipakai = hasil.model;
+        break;
       }
     }
 
-    if (fakta.length < MIN_FAKTA) {
+    if (!naskahModel) {
       throw new Error(
-        `Hanya ${fakta.length} kalimat fakta yang layak dipakai (minimal ${MIN_FAKTA}). Naskah tidak dibuat.`
+        `Naskah dari Gemini tidak memenuhi aturan (terakhir ${total} kata, wajib ${MIN_KATA}-${MAKS_KATA}, minimal ${MIN_FAKTA} fakta bersumber).`
       );
     }
 
     const naskah = {
-      hook,
-      fakta,
-      penutup,
-      pengait,
+      hook: naskahModel.hook,
+      fakta: naskahModel.fakta.map((f) => ({
+        teks: f.teks,
+        sumber: f.sumber,
+        url: sumber.find((s) => s.judul_sumber === f.sumber)?.url ?? "",
+      })),
+      penutup: naskahModel.penutup,
+      pengait: naskahModel.pengait,
       jumlah_kata: total,
-      perkiraan_detik: Math.round(total / 2.5),
+      perkiraan_detik: Math.round(total * DETIK_PER_KATA),
+      dibuat_dengan: modelDipakai,
     };
 
-    const conn = await db.getConnection();
-    try {
-      await conn.beginTransaction();
-      await conn.query(
-        `UPDATE productions SET naskah = ?, status = 'fact_check' WHERE id = ?`,
-        [JSON.stringify(naskah), productionId]
-      );
-      await conn.query(
-        `UPDATE tasks SET status = 'done', catatan_error = NULL, selesai_pada = NOW()
-         WHERE id = ?`,
-        [taskId]
-      );
-      await conn.query(
-        `UPDATE agents
-         SET status = 'idle', tugas_saat_ini = NULL, status_diubah_pada = NOW()
-         WHERE id = ?`,
-        [agent.id]
-      );
-      await conn.commit();
-    } catch (errorTransaksi) {
-      await conn.rollback();
-      throw errorTransaksi;
-    } finally {
-      conn.release();
-    }
-  } catch (error) {
-    const pesan =
-      error instanceof Error ? error.message : "Terjadi kesalahan saat menulis naskah.";
-    await db.query(
-      `UPDATE tasks SET status = 'failed', catatan_error = ?, selesai_pada = NOW()
-       WHERE id = ?`,
-      [pesan.slice(0, 5000), taskId]
-    );
-    await db.query(
-      `UPDATE agents SET status = 'error', status_diubah_pada = NOW() WHERE id = ?`,
-      [agent.id]
-    );
-    await db.query(`UPDATE productions SET status = 'researched' WHERE id = ?`, [
-      productionId,
-    ]);
-  }
-
-  revalidatePath("/writing");
-  revalidatePath("/agents");
-  redirect("/writing");
-}
+    const conn = await
